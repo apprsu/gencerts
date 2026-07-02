@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+
+# Copyright (C) 2026 apprsu
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://gnu.org>.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Настройки по умолчанию (можно переопределить переменными окружения / флагами)
+# ----------------------------------------------------------------------------
+BASE_DIR="${GENCERTS_DIR:-/etc/gencerts}"   # куда складывать сертификаты
+DEFAULT_YEARS=1                              # срок по умолчанию, лет
+LEAF_BITS=2048                               # длина ключа листового сертификата
+CA_BITS=4096                                 # длина ключа ЦС
+CA_MIN_DAYS=3650                             # ЦС живёт не меньше 10 лет
+
+# ----------------------------------------------------------------------------
+# Служебное
+# ----------------------------------------------------------------------------
+PROG="$(basename "$0")"
+
+die()  { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'Внимание: %s\n' "$*" >&2; }
+
+TMP=""
+cleanup() { [[ -n "$TMP" && -d "$TMP" ]] && rm -rf "$TMP"; }
+trap cleanup EXIT
+
+usage() {
+  cat <<EOF
+$PROG — генерация самоподписанных сертификатов, заверенных локальным ЦС.
+
+Использование:
+  $PROG [-d ДОМЕН]... [-y ЛЕТ] [-c ЦС] [--dir КАТАЛОГ]
+  $PROG                     # без аргументов — интерактивный режим
+
+Опции:
+  -d, --domain ДОМЕН   Домен для сертификата. Можно указывать несколько раз.
+                       Поддерживаются wildcard (*.example.com) и IP-адреса.
+                       wildcard лучше брать в кавычки: -d '*.example.com'
+  -y, --years ЛЕТ      Срок действия сертификата в годах (по умолчанию $DEFAULT_YEARS).
+  -c, --ca ЦС          Какой ЦС использовать:
+                         <путь>   — взять существующий ЦС;
+                         new      — создать отдельный ЦС только для этого сертификата;
+                         (без -c) — использовать общий ЦС в \$BASE_DIR/CA.
+  --dir КАТАЛОГ        Базовый каталог для вывода (по умолчанию $BASE_DIR).
+  -h, --help           Показать эту справку.
+
+Существующий ЦС (-c) можно задать как:
+  - каталог (ожидаются файлы rootCA.crt.pem и rootCA.key.pem внутри);
+  - файл ...key.pem (сертификат подберётся как ...crt.pem рядом) или наоборот.
+
+Примеры:
+  $PROG -d one.example.com -d two.example.com -d '*.wild.example.com' -y 5
+  $PROG -d intranet.local -d 192.168.10.5 -c /root/rootCA.key.pem
+  $PROG
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Вспомогательные функции
+# ----------------------------------------------------------------------------
+
+# Похоже ли значение на IP-адрес (грубо: IPv4 либо что-то с двоеточиями = IPv6)
+is_ip() {
+  local x="$1"
+  if [[ "$x" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then return 0; fi
+  if [[ "$x" == *:* && "$x" =~ ^[0-9A-Fa-f:]+$ ]]; then return 0; fi
+  return 1
+}
+
+# Имя каталога из первого домена: убираем ведущий "*." у wildcard
+sanitize_name() {
+  local n="$1"
+  n="${n#\*.}"        # *.wild.example.com -> wild.example.com
+  n="${n//\*/_}"      # на всякий случай прочие "*"
+  n="${n//\//_}"      # и слэши
+  printf '%s' "$n"
+}
+
+# Правильное склонение слова "год"
+years_word() {
+  local n="$1" m100 m10
+  m100=$(( n % 100 )); m10=$(( n % 10 ))
+  if   (( m100 >= 11 && m100 <= 14 )); then printf 'лет'
+  elif (( m10 == 1 ));                 then printf 'год'
+  elif (( m10 >= 2 && m10 <= 4 ));     then printf 'года'
+  else                                       printf 'лет'
+  fi
+}
+
+# Собираем openssl-конфиг (расширения + SAN из списка доменов)
+build_config() {
+  local d ipn=1 dnsn=1
+  {
+    cat <<'CFG'
+[req]
+distinguished_name = req_dn
+prompt = no
+
+[req_dn]
+CN = gencerts
+
+[v3_ca]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+
+[v3_req]
+subjectAltName = @alt_names
+
+[v3_leaf]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth, clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid, issuer
+subjectAltName = @alt_names
+
+[alt_names]
+CFG
+    for d in "${DOMAINS[@]}"; do
+      if is_ip "$d"; then
+        printf 'IP.%d = %s\n'  "$ipn"  "$d"; ipn=$((ipn + 1))
+      else
+        printf 'DNS.%d = %s\n' "$dnsn" "$d"; dnsn=$((dnsn + 1))
+      fi
+    done
+  } > "$CONF"
+}
+
+# Создать новый ЦС: $1=cert $2=key $3=дней $4=CN
+create_ca() {
+  local crt="$1" key="$2" days="$3" cn="$4" dir
+  dir="$(dirname "$crt")"
+  mkdir -p "$dir"
+  ( umask 077; openssl genpkey -algorithm RSA \
+      -pkeyopt rsa_keygen_bits:"$CA_BITS" -out "$key" )
+  openssl req -x509 -new -nodes -key "$key" -sha256 -days "$days" \
+    -out "$crt" -config "$CONF" -extensions v3_ca \
+    -subj "/C=XX/O=gencerts/CN=$cn"
+  chmod 600 "$key"
+  chmod 644 "$crt"
+}
+
+# Разобрать путь к существующему ЦС в пару CA_CRT/CA_KEY
+resolve_existing_ca() {
+  local p="$1"
+  if   [[ -d "$p" ]]; then
+    CA_CRT="$p/rootCA.crt.pem"; CA_KEY="$p/rootCA.key.pem"
+  elif [[ "$p" == *.key.pem ]]; then
+    CA_KEY="$p"; CA_CRT="${p%.key.pem}.crt.pem"
+  elif [[ "$p" == *.crt.pem ]]; then
+    CA_CRT="$p"; CA_KEY="${p%.crt.pem}.key.pem"
+  elif [[ "$p" == *.key ]]; then
+    CA_KEY="$p"; CA_CRT="${p%.key}.crt"
+  elif [[ "$p" == *.crt || "$p" == *.cer || "$p" == *.pem ]]; then
+    CA_CRT="$p"; CA_KEY="${p%.*}.key"
+  else
+    die "Не могу понять путь к ЦС: '$p'. Укажите каталог либо файл ...crt.pem / ...key.pem."
+  fi
+}
+
+# Мягкая проверка, что ключ и сертификат ЦС соответствуют друг другу
+check_ca_pair() {
+  # пропускаем зашифрованные ключи, чтобы не вызывать запрос пароля раньше времени
+  if grep -q "ENCRYPTED" "$CA_KEY" 2>/dev/null; then
+    return 0
+  fi
+  local a b
+  a="$(openssl x509 -in "$CA_CRT" -noout -pubkey 2>/dev/null || true)"
+  b="$(openssl pkey  -in "$CA_KEY" -pubout      2>/dev/null || true)"
+  if [[ -n "$a" && -n "$b" && "$a" != "$b" ]]; then
+    warn "Похоже, ключ и сертификат ЦС не соответствуют друг другу — подпись может не пройти."
+  fi
+}
+
+# Выбрать/создать ЦС. Заполняет CA_CRT, CA_KEY, CA_CREATED.
+setup_ca() {
+  local mode
+  if   [[ -z "$CA_INPUT" ]];     then mode="shared"
+  elif [[ "$CA_INPUT" == "new" ]]; then mode="new"
+  else                                 mode="existing"
+  fi
+
+  case "$mode" in
+    shared)
+      CA_CRT="$BASE_DIR/CA/rootCA.crt.pem"
+      CA_KEY="$BASE_DIR/CA/rootCA.key.pem"
+      if [[ -f "$CA_CRT" && -f "$CA_KEY" ]]; then
+        CA_CREATED=0
+        check_ca_pair
+      else
+        create_ca "$CA_CRT" "$CA_KEY" "$CA_DAYS" "gencerts Shared Root CA"
+        CA_CREATED=1
+      fi
+      ;;
+    new)
+      CA_CRT="$CERT_DIR/rootCA.crt.pem"
+      CA_KEY="$CERT_DIR/rootCA.key.pem"
+      mkdir -p "$CERT_DIR"
+      create_ca "$CA_CRT" "$CA_KEY" "$CA_DAYS" "gencerts Root CA for ${DOMAINS[0]}"
+      CA_CREATED=1
+      ;;
+    existing)
+      resolve_existing_ca "$CA_INPUT"
+      [[ -f "$CA_CRT" ]] || die "Не найден сертификат ЦС: $CA_CRT (нужны и rootCA.crt.pem, и rootCA.key.pem)."
+      [[ -f "$CA_KEY" ]] || die "Не найден ключ ЦС: $CA_KEY (нужны и rootCA.crt.pem, и rootCA.key.pem)."
+      CA_CREATED=0
+      check_ca_pair
+      ;;
+  esac
+}
+
+# Сгенерировать листовой сертификат и собрать fullchain
+gen_leaf() {
+  mkdir -p "$CERT_DIR"
+  ( umask 077; openssl genpkey -algorithm RSA \
+      -pkeyopt rsa_keygen_bits:"$LEAF_BITS" -out "$CERT_DIR/privkey.pem" )
+
+  openssl req -new -key "$CERT_DIR/privkey.pem" -out "$TMP/leaf.csr" \
+    -config "$CONF" -reqexts v3_req \
+    -subj "/C=XX/O=gencerts/CN=$CN"
+
+  openssl x509 -req -in "$TMP/leaf.csr" \
+    -CA "$CA_CRT" -CAkey "$CA_KEY" \
+    -set_serial "0x$(openssl rand -hex 16)" \
+    -sha256 -days "$LEAF_DAYS" \
+    -extfile "$CONF" -extensions v3_leaf \
+    -out "$CERT_DIR/cert.pem"
+
+  # fullchain = листовой сертификат + сертификат ЦС (как у certbot)
+  cat "$CERT_DIR/cert.pem" "$CA_CRT" > "$CERT_DIR/fullchain.pem"
+  # chain.pem (бонус, по аналогии с certbot) — только сертификат ЦС
+  cp -f "$CA_CRT" "$CERT_DIR/chain.pem"
+
+  chmod 600 "$CERT_DIR/privkey.pem"
+  chmod 644 "$CERT_DIR/cert.pem" "$CERT_DIR/fullchain.pem" "$CERT_DIR/chain.pem"
+}
+
+print_report() {
+  local yw; yw="$(years_word "$YEARS")"
+  echo
+  echo "Сертификат успешно создан и подписан на $YEARS $yw."
+  echo "Файлы сертификата находятся в директории $CERT_DIR:"
+  echo
+  echo "    $CERT_DIR/fullchain.pem"
+  echo "    $CERT_DIR/cert.pem"
+  echo "    $CERT_DIR/privkey.pem"
+  echo
+  if (( CA_CREATED == 1 )); then
+    echo "Создан и использован новый ЦС. Он доступен по пути:"
+  else
+    echo "ЦС доступен по пути:"
+  fi
+  echo
+  echo "    сертификат (импортировать в доверенные): $CA_CRT"
+  echo "    ключ ЦС:                                 $CA_KEY"
+  echo
+  echo "Чтобы браузеры и программы доверяли выпущенным сертификатам, импортируйте файл"
+  echo "    $CA_CRT"
+  echo "в доверенные корневые центры сертификации на машинах, где будут открываться сайты."
+  echo
+  echo "nginx-конструкция для добавления сертификатов:"
+  echo
+  echo "    ssl_certificate     $CERT_DIR/fullchain.pem;"
+  echo "    ssl_certificate_key $CERT_DIR/privkey.pem;"
+  echo
+}
+
+# ----------------------------------------------------------------------------
+# Разбор аргументов
+# ----------------------------------------------------------------------------
+DOMAINS=()
+YEARS=""
+CA_INPUT=""
+CA_FLAG_SET=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--domain)
+      [[ $# -ge 2 ]] || die "Опция $1 требует аргумент (домен)."
+      DOMAINS+=("$2"); shift 2 ;;
+    --domain=*|-d=*)
+      DOMAINS+=("${1#*=}"); shift ;;
+    -c|--ca)
+      [[ $# -ge 2 ]] || die "Опция $1 требует аргумент (путь к ЦС или 'new')."
+      CA_INPUT="$2"; CA_FLAG_SET=1; shift 2 ;;
+    --ca=*|-c=*)
+      CA_INPUT="${1#*=}"; CA_FLAG_SET=1; shift ;;
+    -y|--years)
+      [[ $# -ge 2 ]] || die "Опция $1 требует аргумент (число лет)."
+      YEARS="$2"; shift 2 ;;
+    --years=*|-y=*)
+      YEARS="${1#*=}"; shift ;;
+    --dir)
+      [[ $# -ge 2 ]] || die "Опция --dir требует аргумент."
+      BASE_DIR="$2"; shift 2 ;;
+    --dir=*)
+      BASE_DIR="${1#*=}"; shift ;;
+    -h|--help)
+      usage; exit 0 ;;
+    --)
+      shift; break ;;
+    -*)
+      die "Неизвестная опция: $1 (см. $PROG --help)" ;;
+    *)
+      DOMAINS+=("$1"); shift ;;   # позиционный аргумент = домен
+  esac
+done
+
+# ----------------------------------------------------------------------------
+# Проверки окружения
+# ----------------------------------------------------------------------------
+command -v openssl >/dev/null 2>&1 || die "openssl не найден в PATH."
+
+# ----------------------------------------------------------------------------
+# Интерактивный режим (если домены не заданы)
+# ----------------------------------------------------------------------------
+if (( ${#DOMAINS[@]} == 0 )); then
+  echo "На какие домены сертификат? (Разделение пробелами)"
+  read -r -p "> " _line || true
+  read -r -a DOMAINS <<< "${_line:-}"
+  (( ${#DOMAINS[@]} > 0 )) || die "Не указано ни одного домена."
+
+  echo
+  echo "На какой срок, в годах? (По умолчанию: $DEFAULT_YEARS год)"
+  if [[ -z "$YEARS" ]]; then
+    read -r -p "> " _y || true
+    YEARS="${_y:-$DEFAULT_YEARS}"
+  fi
+
+  echo
+  echo "Какой ЦС использовать? (путь до ЦС; либо new для создания нового, отдельного"
+  echo "ЦС для этого сертификата; оставьте пустым для использования общего ЦС"
+  echo "для всех последующих сертификатов)"
+  if (( CA_FLAG_SET == 0 )); then
+    read -r -p "> " _ca || true
+    CA_INPUT="${_ca:-}"
+  fi
+  echo
+fi
+
+# ----------------------------------------------------------------------------
+# Валидация и вычисления
+# ----------------------------------------------------------------------------
+[[ -n "$YEARS" ]] || YEARS="$DEFAULT_YEARS"
+[[ "$YEARS" =~ ^[0-9]+$ ]] || die "Срок (лет) должен быть целым положительным числом: '$YEARS'"
+(( YEARS >= 1 )) || die "Срок должен быть не меньше 1 года."
+
+(( ${#DOMAINS[@]} > 0 )) || die "Не указано ни одного домена."
+
+LEAF_DAYS=$(( YEARS * 365 ))
+CA_DAYS=$LEAF_DAYS
+if (( CA_DAYS < CA_MIN_DAYS )); then CA_DAYS=$CA_MIN_DAYS; fi
+
+CN="${DOMAINS[0]}"
+CN="${CN:0:64}"                                   # CN не длиннее 64 символов
+CERT_DIR="$BASE_DIR/$(sanitize_name "${DOMAINS[0]}")"
+
+# ----------------------------------------------------------------------------
+# Подготовка каталога вывода
+# ----------------------------------------------------------------------------
+if ! mkdir -p "$BASE_DIR" 2>/dev/null; then
+  die "Нет прав на запись в $BASE_DIR. Запустите через sudo или укажите другой путь (--dir / GENCERTS_DIR)."
+fi
+[[ -w "$BASE_DIR" ]] || die "Каталог $BASE_DIR недоступен для записи. Запустите через sudo или укажите --dir."
+
+# ----------------------------------------------------------------------------
+# Генерация
+# ----------------------------------------------------------------------------
+TMP="$(mktemp -d)"
+CONF="$TMP/openssl.cnf"
+build_config
+
+CA_CRT=""; CA_KEY=""; CA_CREATED=0
+setup_ca
+gen_leaf
+
+# Контрольная проверка цепочки
+if ! openssl verify -CAfile "$CA_CRT" "$CERT_DIR/cert.pem" >/dev/null 2>&1; then
+  warn "Проверка цепочки сертификата не прошла — стоит проверить результат вручную."
+fi
+
+print_report
